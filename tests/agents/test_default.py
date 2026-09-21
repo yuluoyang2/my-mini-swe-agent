@@ -170,6 +170,29 @@ def test_step_limit_enforcement(model_factory):
     assert agent.n_calls == 1
 
 
+def test_step_limit_can_force_one_final_submission(model_factory):
+    factory, config = model_factory
+    agent = DefaultAgent(
+        model=factory(
+            [
+                ("First command", [{"command": "echo 'step1'"}]),
+                (
+                    "Forced final",
+                    [{"command": "echo 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT'\necho 'forced'"}],
+                ),
+            ]
+        ),
+        env=LocalEnvironment(),
+        **{**config, "step_limit": 1, "force_final_on_step_limit": True},
+    )
+
+    info = agent.run("Run then submit")
+    assert info["exit_status"] == "Submitted"
+    assert info["submission"] == "forced\n"
+    assert agent.n_calls == 2
+    assert any("Tool budget is exhausted" in get_text(message) for message in agent.messages)
+
+
 def test_cost_limit_enforcement(model_factory):
     """Test agent stops when cost limit is reached."""
     factory, config = model_factory

@@ -29,6 +29,12 @@ class AgentConfig(BaseModel):
     """Stop agent after exceeding (!) this cost."""
     wall_time_limit_seconds: int = 0
     """Stop agent after this many seconds of wall-clock time. 0 means no limit."""
+    force_final_on_step_limit: bool = False
+    """If true, ask for one last submission when the step limit is hit instead of exiting immediately."""
+    force_final_template: str = (
+        "Tool budget is exhausted. Do not gather more evidence. "
+        "Submit the best result you have now using the existing completion procedure."
+    )
     max_consecutive_format_errors: int = 3
     """Exit after this many format errors in a row (0 = no limit)."""
     output_path: Path | None = None
@@ -47,6 +53,7 @@ class DefaultAgent:
         self.cost = 0.0
         self.n_calls = 0
         self.n_consecutive_format_errors = 0
+        self._forced_final = False
         self._start_time = time.time()
 
     def get_template_vars(self, **kwargs) -> dict:
@@ -129,14 +136,13 @@ class DefaultAgent:
 
     def query(self) -> dict:
         """Query the model and return model messages. Override to add hooks."""
-        if 0 < self.config.step_limit <= self.n_calls or 0 < self.config.cost_limit <= self.cost:
-            raise LimitsExceeded(
-                {
-                    "role": "exit",
-                    "content": "LimitsExceeded",
-                    "extra": {"exit_status": "LimitsExceeded", "submission": ""},
-                }
-            )
+        limits_message = {
+            "role": "exit",
+            "content": "LimitsExceeded",
+            "extra": {"exit_status": "LimitsExceeded", "submission": ""},
+        }
+        if 0 < self.config.cost_limit <= self.cost:
+            raise LimitsExceeded(limits_message)
         if 0 < self.config.wall_time_limit_seconds <= int(time.time() - self._start_time):
             raise TimeExceeded(
                 {
@@ -145,6 +151,17 @@ class DefaultAgent:
                     "extra": {"exit_status": "TimeExceeded", "submission": ""},
                 }
             )
+        if 0 < self.config.step_limit <= self.n_calls:
+            if self.config.force_final_on_step_limit and not self._forced_final:
+                self._forced_final = True
+                self.add_messages(
+                    self.model.format_message(
+                        role="user",
+                        content=self._render_template(self.config.force_final_template),
+                    )
+                )
+            else:
+                raise LimitsExceeded(limits_message)
         self.n_calls += 1
         message = self.model.query(self.messages)
         self.cost += message.get("extra", {}).get("cost", 0.0)

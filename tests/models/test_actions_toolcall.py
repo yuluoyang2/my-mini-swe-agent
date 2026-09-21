@@ -125,6 +125,17 @@ class TestFormatToolcallObservationMessages:
         )
         assert result[0]["content"] == "result - extra_info"
 
+    def test_with_action_template_var(self):
+        actions = [{"tool": "get_function_source", "args": {"function": "nr_rt_ioctl"}, "tool_call_id": "call_1"}]
+        outputs = [{"output": '{"records": []}', "returncode": 0}]
+        result = format_toolcall_observation_messages(
+            actions=actions,
+            outputs=outputs,
+            observation_template="{{ action.tool }} -> {{ output.output }}",
+        )
+        assert result[0]["content"] == 'get_function_source -> {"records": []}'
+        assert result[0]["extra"]["tool"] == "get_function_source"
+
     def test_exception_info_in_extra(self):
         actions = [{"command": "test", "tool_call_id": "call_1"}]
         outputs = [{"output": "", "returncode": 1, "exception_info": "Error occurred", "extra": {"detail": "more"}}]

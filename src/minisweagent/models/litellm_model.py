@@ -6,14 +6,16 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "true")
+
 import litellm
 from pydantic import BaseModel
 
 from minisweagent.exceptions import FormatError
 from minisweagent.models import GLOBAL_MODEL_STATS
 from minisweagent.models.utils.actions_toolcall import (
-    BASH_TOOL,
     format_toolcall_observation_messages,
+    get_tool_specs,
     parse_toolcall_actions,
 )
 from minisweagent.models.utils.anthropic_utils import _reorder_anthropic_thinking_blocks
@@ -38,12 +40,15 @@ class LitellmModelConfig(BaseModel):
     format_error_template: str = "{{ error }}"
     """Template used when the LM's output is not in the expected format."""
     observation_template: str = (
+        "<tool>{{action.tool|default('bash')}}</tool>\n"
         "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
         "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
     )
     """Template used to render the observation after executing an action."""
     multimodal_regex: str = ""
     """Regex to extract multimodal content. Empty string disables multimodal processing."""
+    tools: list[str] = ["bash"]
+    """Tool groups exposed to the model. Use an empty list to expose no tools."""
 
 
 class LitellmModel:
@@ -66,7 +71,7 @@ class LitellmModel:
             return litellm.completion(
                 model=self.config.model_name,
                 messages=messages,
-                tools=[BASH_TOOL],
+                tools=get_tool_specs(self.config.tools),
                 **(self.config.model_kwargs | kwargs),
             )
         except litellm.exceptions.AuthenticationError as e:
@@ -130,6 +135,7 @@ class LitellmModel:
         tool_calls = response.choices[0].message.tool_calls or []
         return parse_toolcall_actions(
             tool_calls,
+            tools=get_tool_specs(self.config.tools),
             format_error_template=self.config.format_error_template,
             template_kwargs={"finish_reason": response.choices[0].finish_reason},
         )
