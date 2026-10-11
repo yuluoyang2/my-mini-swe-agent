@@ -19,7 +19,20 @@ CONST_RE = re.compile(rf"^({NAME_RE})\s*=")
 
 
 def strip_comment(line: str) -> str:
-    return line.split("#", 1)[0].rstrip()
+    quoted = False
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            quoted = not quoted
+        elif char == "#" and not quoted:
+            return line[:index].rstrip()
+    return line.rstrip()
 
 
 def count_delta(line: str, open_ch: str, close_ch: str) -> int:

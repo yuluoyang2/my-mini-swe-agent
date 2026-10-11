@@ -88,9 +88,9 @@ FUNC_BFS_TOOL = {
     "function": {
         "name": "func_bfs",
         "description": (
-            "Bounded BFS over the kernel callgraph. Default direction is reverse: walk callers "
-            "toward syscall entry. Each node includes path-to-start; nearest nodes include truncated source. "
-            "depth=1 reverse is direct callers; depth=1 forward is direct callees."
+            "Bounded BFS over an MLTA callgraph. Edges are a hint: indirect calls can be "
+            "spurious or missing. Confirm a path in source before treating it as real. "
+            "Default direction is reverse. depth=1 reverse is direct callers; depth=1 forward is direct callees."
         ),
         "parameters": {
             "type": "object",
@@ -182,18 +182,68 @@ READ_SYZLANG_DEF_TOOL = {
     },
 }
 
-GET_SYSCALL_DEPS_TOOL = {
+LIST_SYZLANG_CHOICES_TOOL = {
     "type": "function",
     "function": {
-        "name": "get_syscall_deps",
-        "description": "Read explicit depend/depended edges for one or more syzkaller syscalls. The graph only records direct flavor-resource links (e.g. socket$foo → bind$foo). Unflavored generic calls are often absent; missing edges do not mean those steps are invalid after a socket.",
+        "name": "list_syzlang_choices",
+        "description": (
+            "List union arms and flags values reachable from one or more syscalls. "
+            "Use this when refining selected chain calls. "
+            "Returns compact choice names, not full nested struct bodies."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "syscalls": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Syzlang syscall names, usually every step in a candidate chain. The graph only contains explicit flavor-resource edges; unflavored generic calls are often missing.",
+                    "description": "Syzlang syscall names, usually every unique call in the candidate chains.",
+                },
+            },
+            "required": ["syscalls"],
+        },
+    },
+}
+
+READ_SYZLANG_LEVEL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_syzlang_level",
+        "description": (
+            "Read exactly one level of a syscall's syzlang parameter tree. Start with an empty path, "
+            "then expand only paths returned by the previous result. Recommend union, flags, "
+            "named const, and string choices that can reach the target. Drop choices that cannot. "
+            "Integers, len, bytesize, bitsize, csum, proc, and resource stay with syzkaller."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "call": {
+                    "type": "string",
+                    "description": "Existing syzkaller syscall name.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Path returned by an earlier read_syzlang_level call. Omit for syscall arguments.",
+                },
+            },
+            "required": ["call"],
+        },
+    },
+}
+
+GET_SYSCALL_DEPS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_syscall_deps",
+        "description": "Read explicit depend/depended edges for one or more syzkaller syscalls. The graph has only explicit resource links (e.g. socket$foo → bind$foo) and does not include implicit dependencies.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "syscalls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Syzlang syscall names, usually every step in a candidate chain. The graph only contains explicit resource edges, not implicit ones.",
                 },
                 "include_depend": {
                     "type": "boolean",
@@ -219,13 +269,48 @@ SYZLANG_TOOLS = [
     GET_SYSCALL_DEPS_TOOL,
 ]
 
+LIST_PRUNABLE_NODES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_prunable_nodes",
+        "description": (
+            "List prunable parameter nodes for syscalls on the chain. "
+            "Each node is a union, flags, or string with at least two named choices. "
+            "path, kind, type, and choices can be copied into write_refine_result. "
+            "keep must be a subset of choices. An empty list means that syscall has nothing to prune."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "calls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Syzlang syscall names from the written chain.",
+                },
+            },
+            "required": ["calls"],
+        },
+    },
+}
+
+SYZLANG_LEVEL_TOOLS = [
+    LIST_PRUNABLE_NODES_TOOL,
+    READ_SYZLANG_LEVEL_TOOL,
+]
+
+SYZLANG_CHOICES_TOOLS = [
+    LIST_SYZLANG_CHOICES_TOOL,
+]
+
 GET_FUZZ_COVERAGE_TOOL = {
     "type": "function",
     "function": {
         "name": "get_fuzz_coverage",
         "description": (
             "Look up dynamic fuzzing coverage. Supply exactly one of functions, syscall, or query. "
-            "A hit is ground truth from real runs; absence only means the function or syscall was not observed."
+            "A hit shows that syscall appeared in a real run that reached the function. "
+            "It does not mean the preceding setup calls can be omitted. "
+            "Absence only means the function or syscall was not observed."
         ),
         "parameters": {
             "type": "object",
@@ -270,8 +355,10 @@ WRITE_CHAIN_RESULT_TOOL = {
     "function": {
         "name": "write_chain_result",
         "description": (
-            "Validate and write the final target-to-syzkaller syscall-chain result to a JSON file. "
-            "A successful write finishes the task. Rejects unknown syscall names and fully duplicate chains."
+            "Validate and write the final target-to-syzkaller syscall-chain result. "
+            "Each chain step may retain syzlang union, flags, const, integer, or string values "
+            "after level-by-level inspection. "
+            "A successful write finishes the task."
         ),
         "parameters": {
             "type": "object",
@@ -296,35 +383,31 @@ WRITE_CHAIN_RESULT_TOOL = {
                                             "type": "string",
                                             "description": "Existing syzkaller syscall name.",
                                         },
-                                        "params": {
+                                        "refinements": {
                                             "type": "array",
-                                            "description": "Optional top-level argument hints: union, const, or flags. Nested fields are not supported.",
+                                            "description": "Optional concrete syzlang values to retain for this call occurrence.",
                                             "items": {
                                                 "type": "object",
                                                 "properties": {
-                                                    "kind": {
-                                                        "type": "string",
-                                                        "description": "union, const, or flags.",
-                                                    },
-                                                    "arg": {
-                                                        "type": "string",
-                                                        "description": "Top-level syzlang argument name.",
-                                                    },
-                                                    "index": {
-                                                        "type": "integer",
-                                                        "description": "0-based top-level argument index, used if arg is omitted.",
-                                                    },
                                                     "path": {
                                                         "type": "string",
-                                                        "description": "For union: type.field of the chosen arm.",
+                                                        "description": "Node path returned by read_syzlang_level. For a union this is the union node, not an arm path.",
                                                     },
-                                                    "values": {
+                                                    "kind": {
+                                                        "type": "string",
+                                                        "enum": ["union", "flags", "const", "scalar", "string"],
+                                                    },
+                                                    "type": {
+                                                        "type": "string",
+                                                        "description": "Exact syzlang type returned for the node.",
+                                                    },
+                                                    "keep": {
                                                         "type": "array",
                                                         "items": {"type": "string"},
-                                                        "description": "For const/flags: names from the syzlang definition.",
+                                                        "description": "Values to retain. Union, flags, and const must come from the node's choices. Scalar keeps integers. String keeps literals.",
                                                     },
                                                 },
-                                                "required": ["kind"],
+                                                "required": ["path", "kind", "type", "keep"],
                                             },
                                         },
                                     },
@@ -380,13 +463,94 @@ CHAIN_RESULT_TOOLS = [
     WRITE_CHAIN_RESULT_TOOL,
 ]
 
+READ_CHAIN_RESULT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_chain_result",
+        "description": "Read the written syscall call sequences for a target. Returns chains of call names only.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Target Linux kernel function name."},
+                "path": {
+                    "type": "string",
+                    "description": "Optional chain-result path. Defaults to data/linux-6.6/results/<target>.chains.json.",
+                },
+            },
+            "required": ["target"],
+        },
+    },
+}
+
+WRITE_REFINE_RESULT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "write_refine_result",
+        "description": (
+            "Write one keep-list per syscall and finish. "
+            "Keep union, flags, named const, and string choices that can reach the target. "
+            "Do not recommend integers."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Target from the written chain result."},
+                "calls": {
+                    "type": "array",
+                    "description": "One entry per syscall that has something to prune. An empty list is valid.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "call": {"type": "string"},
+                            "refinements": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "kind": {
+                                            "type": "string",
+                                            "enum": ["union", "flags", "const", "string"],
+                                        },
+                                        "type": {"type": "string"},
+                                        "keep": {"type": "array", "items": {"type": "string"}},
+                                    },
+                                    "required": ["path", "kind", "type", "keep"],
+                                },
+                            },
+                        },
+                        "required": ["call", "refinements"],
+                    },
+                },
+                "chain_path": {
+                    "type": "string",
+                    "description": "Optional written chain-result path.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional output path. Defaults to data/linux-6.6/results/<target>.refine.json beside the chain file.",
+                },
+            },
+            "required": ["target", "calls"],
+        },
+    },
+}
+
+REFINE_RESULT_TOOLS = [
+    READ_CHAIN_RESULT_TOOL,
+    WRITE_REFINE_RESULT_TOOL,
+]
+
 TOOL_GROUPS = {
     "bash": [BASH_TOOL],
     "kernel_source": KERNEL_SOURCE_TOOLS,
     "callgraph": FUNC_GRAPH_TOOLS,
     "syzlang": SYZLANG_TOOLS,
+    "syzlang_level": SYZLANG_LEVEL_TOOLS,
+    "syzlang_choices": SYZLANG_CHOICES_TOOLS,
     "fuzzing_coverage": FUZZING_COVERAGE_TOOLS,
     "chain_result": CHAIN_RESULT_TOOLS,
+    "refine_result": REFINE_RESULT_TOOLS,
 }
 
 

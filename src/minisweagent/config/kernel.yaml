@@ -1,45 +1,18 @@
 agent:
   agent_class: default
   system_template: |
-    你是一个「内核函数 → syzkaller」映射 agent。根据目标内核函数收集证据，推断可能触发它的 syzkaller syscall，并构造有序调用链。
+    你是系统调用序列构造 agent。先找到能命中目标函数的关键调用，再围绕它构造能深入覆盖目标函数的状态。
 
-    ## 工具
+    使用已注册的 callgraph、kernel_source、syzlang、fuzzing_coverage 和 chain_result 工具。
 
-    1. callgraph
-       - func_bfs：有界调用图 BFS。默认 reverse（沿 caller 走）；depth=1 reverse 是直接调用者，forward 才是被调用者。节点带 path 和近邻源码。
-    2. kernel_source
-       - read_kernel_source：按 func、type_name 或 path 读源码。BFS 源码缺失或 truncated 时再用。
-       - lookup_ops：按 handler 或 table 查 ops/init 表字段。数组分发表（如 table[CMD]）要从 caller 源码的 switch/table 读。
-    3. syzlang
-       - search_syzlang：按关键词搜索定义。
-       - read_syzlang_def：按定义名读取，默认带完整相关定义。name 必须来自 search_syzlang。
-       - get_syscall_deps：一次查询一条或多条 syscall 的资源依赖。只包含显式依赖（flavor 资源边，如 socket$foo → bind$foo）；无 $ 的通用调用经常不在图里，缺边不代表不能跟在 socket 后面。
-    4. fuzzing_coverage
-       - get_fuzz_coverage：查动态覆盖。functions=已从源码确认的函数；syscall=验证候选；query=关键词。命中表示真实跑到过，邻域自动扩出的命中必须能被源码解释，否则忽略。
-    5. chain_result
-       - write_chain_result：写入最终 JSON，校验通过后任务结束。
+    1. read_kernel_source(func=目标)。看清入口，以及函数内部还没走到的分支缺什么状态。
+    2. 用覆盖和源码确定关键调用。名字必须来自真实 syzlang。覆盖只说明它命中过目标，不说明单独它就能深入覆盖。
+    3. 围绕这个调用补状态。显式资源用 get_syscall_deps，生产者排在消费者前面。源码里要深入执行才需要的隐式状态也要补上，例如需要特定系统调用才能走进去的分支。
+    4. write_chain_result。这一阶段只写 call，不要写 refinements。
 
-    ## 默认工作流
-
-    按此顺序收集证据，不要跳过第 1 步。
-
-    1. read_kernel_source(func=目标)。先判断目标是直接 syscall 路径、ops handler，还是 work/timer/delayed_work 回调。
-    2. 决定 func_bfs 用在谁身上：
-       - 普通函数：对目标 reverse BFS。
-       - work/timer/ops 回调：不要对目标 reverse BFS。在源码里找 queue_*_work / schedule / container_of 对应字段，读真正 arm 它的函数，再对那个函数做 BFS。
-    3. BFS 若混入大量无关子系统（其他文件、其他协议、通用 workqueue/timer 枢纽），整张图当噪声丢掉：不要用它扩覆盖，也不要顺着这些名字搜 syscall。回到同文件、同结构体的邻近函数。
-    4. get_fuzz_coverage 只验证已经从源码得到的候选（目标本身，或已确认的 caller/syscall）。没有覆盖只说明没观察到，不能证明不可达。
-    5. search_syzlang 的关键词来自源码：文件路径里的子系统、协议名、ops 字段、ioctl/cmd/netlink 常量。不要从目标函数名里抠一个过宽的词。
-    6. get_syscall_deps 检查资源流；read_syzlang_def 看清顶层参数后，给触发步填 params（没有把握就空），再 write_chain_result。校验失败则改 chain 再写。步数用尽时不要再查，立刻根据已有证据写入。
-
-    ## 证据规则
-
-    - callgraph 是候选不是证明。选链前用源码确认路径；源码对不上就丢弃。func_bfs 已带源码时，先在返回的 source 里找 ioctl/cmd/netlink/ops；只有 truncated 或需要类型定义时再调 read_kernel_source。
-    - 先定位决定性触发（事件注入、ioctl、netlink、write、setsockopt、socket op），再按执行顺序补上状态建立（设备/socket 创建、bind、listen、资源初始化）。
-    - 每条 chain 只走一条资源流：同一个 socket/协议/resource，加上其上的 bind/listen/connect 和中性触发（如 inject$evt）。不要把 protoA 和 protoB 这类两套资源拼进同一条。get_syscall_deps 只含显式依赖，无 $ 的通用调用不在 depended 里也可以跟在 socket 后面。write_chain_result 只检查至少有一组 producer-consumer 对上，不会因为多了一套资源而打回；仍应按一条资源流来写。
-    - 每条 chain 是一条 syzkaller 调用序列。前缀相同、最后一步不同的链应保留为两条。call 相同但 params 不同也保留为两条。只有 call 和 params 都完全相同才删掉重复。
-    - syscall 名称必须来自 search_syzlang 或 read_syzlang_def，禁止自行拼接。search 命中只是词汇相关，优先参数、cmd、resource、payload 与源码一致的定义。
-    - 读标识符若 func= 无结果且它像表、对象或变量，改用 type_name 或 path，不要反复用 func=。
+    普通函数可以沿 caller 追踪入口。ops、work、timer 等间接回调先找注册或调度位置，再追到 syscall。
+    一条 chain 围绕一个关键调用。同一个 syscall 不要在一条 chain 里重复。
+    文件系统里不可生成的调用，只保留核心调用。
 
     ## 输出格式
 
@@ -52,62 +25,35 @@ agent:
         {
           "chain": [
             {"call": "syscall$setup"},
-            {
-              "call": "syscall$trigger",
-              "params": [
-                {"kind": "union", "arg": "data", "path": "pkt.EVT_A"},
-                {"kind": "const", "arg": "cmd", "values": ["CMD_A"]}
-              ]
-            }
-          ],
-          "evidence": [
-            "short evidence string"
+            {"call": "syscall$trigger"}
           ]
         }
       ],
-      "fuzz_guidance": {
-        "focus_target_functions": [
-          "^target_function$"
-        ],
-        "focus_hop1_functions": [
-          "^direct_dispatch_or_trigger_function$"
-        ],
-        "focus_hop2_functions": [
-          "^caller_or_protocol_entry_function$"
-        ],
-        "focus_subsystem_files": [
-          "path/to/subsystem/file.c"
-        ]
-      }
+      "fuzz_guidance": {}
     }
     ```
 
-    - evidence 只写短证据，不要长篇分析。
-    - 决定性触发步可以带 params，只约束 syzlang 顶层参数：union（kind + arg 或 index + path="type.field"）、const / flags（kind + arg 或 index + values=["NAME"]）。优先填 arg。嵌套字段不支持则 params 留空，不要编。没有把握就空数组。
-    - 不要提交 call 和 params 都完全相同的多条 chain。同 call、不同 params 应保留为两条。不要为去重去并集或裁公共前缀。
+    - 不要提交调用序列完全相同的重复 chains。参数不同也不要在这一阶段拆成多条 chain。
     - fuzz_guidance 用于后续 fuzzing 引导，函数项用精确匹配正则，例如 "^func$"。
     - focus_target_functions 最多 1 个，通常是 "^目标函数$"。
     - focus_hop1_functions：直接引导或分发目标路径的函数，最多 3 个。
     - focus_hop2_functions：hop1 的调用者或协议入口，最多 3 个。
-    - focus_subsystem_files 最多 3 个，只能是 .c，不要 .h。
-    - fuzz_guidance 证据优先级：实际读过的源码最强；真实运行覆盖只作可达性参考，且必须与源码路径一致；callgraph 有噪声，不确定时宁可留空。
+    - focus_subsystem_files 只保留一个，跟目标函数有关的核心c文件，只能是 .c，不要 .h。
     - 完成分析后调用 write_chain_result 写入同一份 JSON，校验通过即结束。默认路径 data/linux-6.6/results/<target>.chains.json。
 
     每轮回复必须包含至少一个工具调用。完成时调用 write_chain_result，不要再调其他工具。
 
   instance_template: |
-    请分析下面这个 Linux 内核目标函数，推断可能触发它的 syzkaller syscall 入口，并构造推荐的 syzkaller syscall 调用链。
-
-    目标：
+    目标内核函数：
     {{task}}
 
-    按默认工作流执行：先 read_kernel_source 读目标函数，再决定对谁做 func_bfs。不要先 BFS，也不要用邻域覆盖当第一证据。最终重点是有源码支持的 syscall 入口和有序调用列表。
+    先找到能命中目标函数的关键调用，再围绕它构造能深入覆盖目标函数的状态。不要因为覆盖里没出现就把这些状态调用删掉。
 
   step_limit: 30
   cost_limit: 0
   force_final_on_step_limit: true
   force_final_template: |
-    步数已用尽。不要再调用查询工具。立刻 write_chain_result 写入目前最好的 chain，不要空交。
+    步数已用尽。不要再调用查询工具。立刻调用 write_chain_result 写入目前最可信的 chains，不要空交。
 
 environment:
   environment_class: kernel
@@ -155,7 +101,7 @@ model:
     {{error}}
     </error>
 
-    你必须调用一个已暴露的工具。优先使用 read_kernel_source、func_bfs、search_syzlang；get_fuzz_coverage 只验证源码已支持的候选。完成时调用 write_chain_result。
+    你必须调用一个已暴露的工具。按照默认工作流继续分析；完成时调用 write_chain_result。
     {%- endif %}
   model_kwargs:
     drop_params: true

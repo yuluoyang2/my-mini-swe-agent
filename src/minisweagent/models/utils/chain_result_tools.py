@@ -6,10 +6,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from minisweagent.models.utils.syzlang_tools import is_refinable, read_syzlang_level
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_DATA_ROOT = REPO_ROOT / "data/linux-6.6"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "data/linux-6.6/results"
+REFINEMENT_KINDS = {"union", "flags", "const", "scalar", "string"}
+INT_VALUE_RE = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+)\Z")
 
 
 def safe_filename(name: str) -> str:
@@ -48,28 +51,26 @@ def step_fingerprint(step: dict[str, Any]) -> str:
     return json.dumps(step, sort_keys=True, ensure_ascii=False)
 
 
-PARAM_KINDS = {"union", "const", "flags"}
-
-
-def validate_step_params(step: dict[str, Any], loc: str) -> None:
-    params = step.get("params")
-    if params is None:
-        return
-    if not isinstance(params, list):
-        raise ValueError(f"{loc}.params must be a list")
-    for param_index, param in enumerate(params):
-        prefix = f"{loc}.params[{param_index}]"
-        if not isinstance(param, dict):
-            raise ValueError(f"{prefix} must be an object")
-        kind = str(param.get("kind") or "").lower()
-        if kind not in PARAM_KINDS:
-            raise ValueError(f"{prefix}.kind must be union, const, or flags")
-        if kind == "union" and not param.get("path"):
-            raise ValueError(f"{prefix} union requires path")
-        if kind in {"const", "flags"}:
-            values = param.get("values")
-            if not isinstance(values, list) or not values:
-                raise ValueError(f"{prefix} {kind} requires a non-empty values list")
+def validate_step_refinements(step: dict[str, Any], loc: str) -> None:
+    if "params" in step:
+        raise ValueError(f"{loc} must use refinements instead of params")
+    refinements = step.get("refinements", [])
+    if not isinstance(refinements, list):
+        raise ValueError(f"{loc}.refinements must be a list")
+    for index, refinement in enumerate(refinements):
+        ref_loc = f"{loc}.refinements[{index}]"
+        if not isinstance(refinement, dict):
+            raise ValueError(f"{ref_loc} must be an object")
+        if refinement.get("kind") not in REFINEMENT_KINDS:
+            raise ValueError(f"{ref_loc}.kind must be union, flags, const, scalar, or string")
+        for key in ("path", "type"):
+            if not isinstance(refinement.get(key), str) or not refinement[key]:
+                raise ValueError(f"{ref_loc}.{key} must be a non-empty string")
+        keep = refinement.get("keep")
+        if not isinstance(keep, list) or not keep or not all(isinstance(value, str) and value for value in keep):
+            raise ValueError(f"{ref_loc}.keep must be a non-empty list of strings")
+        if len(keep) != len(set(keep)):
+            raise ValueError(f"{ref_loc}.keep must not contain duplicates")
 
 
 def is_producer(call: str, deps: dict[str, dict[str, Any]]) -> bool:
@@ -110,7 +111,7 @@ def validate_chain_result(target: str, chains: list[dict[str, Any]]) -> None:
         for step_index, step in enumerate(chain):
             if not isinstance(step, dict) or not isinstance(step.get("call"), str) or not step["call"]:
                 raise ValueError(f"chains[{chain_index}].chain[{step_index}] must contain a non-empty call")
-            validate_step_params(step, f"chains[{chain_index}].chain[{step_index}]")
+            validate_step_refinements(step, f"chains[{chain_index}].chain[{step_index}]")
         evidence = record.get("evidence", [])
         if evidence is not None and not isinstance(evidence, list):
             raise ValueError(f"chains[{chain_index}].evidence must be a list when present")
@@ -132,6 +133,34 @@ def validate_chain_semantics(chains: list[dict[str, Any]], *, data_root: Path) -
             + ". Use search_syzlang/read_syzlang_def to find real names."
         )
 
+    for chain_index, record in enumerate(chains):
+        for step_index, step in enumerate(record["chain"]):
+            for refinement_index, refinement in enumerate(step.get("refinements", [])):
+                loc = f"chains[{chain_index}].chain[{step_index}].refinements[{refinement_index}]"
+                level = read_syzlang_level(step["call"], refinement["path"], data_root=data_root)
+                node = level["node"]
+                if node.get("kind") != refinement["kind"]:
+                    raise ValueError(f"{loc}.kind does not match syzlang node kind {node.get('kind')!r}")
+                if not is_refinable(node):
+                    raise ValueError(
+                        f"{loc} cannot constrain {node.get('expression', node.get('type'))}; "
+                        "len, bytesize, bitsize, csum, proc, and resource stay with syzkaller"
+                    )
+                if node.get("type") != refinement["type"]:
+                    raise ValueError(f"{loc}.type does not match syzlang node type {node.get('type')!r}")
+                choices = {
+                    choice["name"] if isinstance(choice, dict) else choice
+                    for choice in level.get("choices", [])
+                }
+                if choices:
+                    unknown = sorted(set(refinement["keep"]) - choices)
+                    if unknown:
+                        raise ValueError(f"{loc}.keep contains unknown choices: {', '.join(unknown)}")
+                elif node["kind"] == "scalar":
+                    bad = [value for value in refinement["keep"] if not INT_VALUE_RE.fullmatch(value)]
+                    if bad:
+                        raise ValueError(f"{loc}.keep contains non-integer values: {', '.join(bad)}")
+
     warnings = []
     for chain_index, record in enumerate(chains):
         calls = step_calls(record["chain"])
@@ -147,9 +176,9 @@ def validate_chain_semantics(chains: list[dict[str, Any]], *, data_root: Path) -
         previous = fingerprints.setdefault(fingerprint, chain_index)
         if previous != chain_index:
             raise ValueError(
-                f"chains[{chain_index}] repeats chains[{previous}] with the same syscall sequence: "
+                f"chains[{chain_index}] repeats chains[{previous}] with the same calls and refinements: "
                 f"{step_calls(record['chain'])}. Drop the duplicate and keep one copy. "
-                "Same calls with different params are distinct; do not merge them."
+                "The same calls with different refinements are distinct."
             )
     return warnings
 
@@ -176,6 +205,17 @@ def validate_fuzz_guidance(fuzz_guidance: dict[str, Any] | None) -> None:
             raise ValueError("fuzz_guidance.focus_subsystem_files must not contain header files")
 
 
+
+def reject_chain_refinements(chains: list[dict[str, Any]]) -> None:
+    for chain_index, record in enumerate(chains):
+        for step_index, step in enumerate(record["chain"]):
+            if step.get("refinements"):
+                raise ValueError(
+                    f"chains[{chain_index}].chain[{step_index}] must not include refinements; "
+                    "write the call sequence first, then refine parameters from that fixed chain"
+                )
+
+
 def write_chain_result(
     target: str,
     chains: list[dict[str, Any]],
@@ -186,6 +226,7 @@ def write_chain_result(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
 ) -> dict[str, Any]:
     validate_chain_result(target, chains)
+    reject_chain_refinements(chains)
     validation_warnings = validate_chain_semantics(chains, data_root=data_root)
     validate_fuzz_guidance(fuzz_guidance)
     output_path = Path(path) if path else output_dir / f"{safe_filename(target)}.chains.json"

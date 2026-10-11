@@ -1,0 +1,102 @@
+agent:
+  agent_class: default
+  system_template: |
+    你是 syscall 参数裁剪 agent。调用序列已经写好。
+    目标是提高目标函数的整体覆盖，并减少无关参数的影响。删掉不可能到达目标函数的候选项，能到达的都留下。
+
+     ## 工具
+
+    使用已注册的 kernel_source、syzlang、syzlang_level 和 refine_result 工具。
+    具体参数、默认行为和返回格式以工具描述为准。
+
+     ## 推荐工作流
+
+    1. read_chain_result(target=目标)。这里只有调用名。
+    2. read_kernel_source(func=目标)。用 list_prunable_nodes 判断哪些候选项到不了目标。
+    3. write_refine_result。每个系统调用写一条。一个字段的候选项一个都没删就不要写。全部没有就返回空 calls。
+
+    ## 判断原则
+
+    - 只从 list_prunable_nodes 里选。keep 必须是 choices 的真子集，能到达目标的都留下。
+    - 某个 union arm 没留下时，不要写它下面的字段。
+    - 整数留给 syzkaller 变异。列表为空的调用不要写。
+
+    ```json
+    {
+      "target": "target_function",
+      "calls": [
+        {
+          "call": "syscall$trigger",
+          "refinements": [
+            {"path": "arg.type", "kind": "flags", "type": "request_types", "keep": ["TARGET_REQUEST"]}
+          ]
+        }
+      ]
+    }
+    ```
+
+    写入 data/linux-6.6/results/<target>.refine.json。
+    每轮至少一个工具调用。完成时只调用 write_refine_result。
+
+  instance_template: |
+    目标内核函数：
+    {{task}}
+
+    先 read_chain_result(target=目标)，再读目标函数源码。用 list_prunable_nodes 删掉到不了目标的候选项。能到达的都留下。没有就返回空 calls。
+
+  step_limit: 40
+  cost_limit: 0
+  force_final_on_step_limit: true
+  force_final_template: |
+    步数已用尽。立刻 write_refine_result。每个系统调用一条，只写 union、flags、带名字的 const、字符串。能到达目标的都留下。
+
+environment:
+  environment_class: kernel
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: "off"
+    TQDM_DISABLE: "1"
+
+model:
+  cost_tracking: ignore_errors
+  tools:
+    - kernel_source
+    - syzlang
+    - syzlang_level
+    - refine_result
+  observation_template: |
+    {%- if output.output | length < 40000 -%}
+    {
+      "tool": {{ action.tool | tojson }},
+      "returncode": {{ output.returncode }},
+      "output": {{ output.output | tojson }}
+      {%- if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}
+    }
+    {%- else -%}
+    {
+      "tool": {{ action.tool | tojson }},
+      "returncode": {{ output.returncode }},
+      "output_head": {{ output.output[:18000] | tojson }},
+      "output_tail": {{ output.output[-18000:] | tojson }},
+      "elided_chars": {{ output.output | length - 36000 }},
+      "warning": "Output too long."
+      {%- if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}
+    }
+    {%- endif -%}
+  format_error_template: |
+    {% if finish_reason is defined and (finish_reason == "length" or (finish_reason == "tool_calls" and not has_tool_calls)) -%}
+    你的上一轮回复在产生工具调用前被截断了。请更简洁地继续，并且必须包含至少一个工具调用。
+    {%- else -%}
+    工具调用格式错误：
+
+    <error>
+    {{error}}
+    </error>
+
+    你必须调用一个已暴露的工具。完成时调用 write_refine_result。按系统调用写，只写 union、flags、带名字的 const、字符串。
+    {%- endif %}
+  model_kwargs:
+    drop_params: true
+    temperature: 0.1
