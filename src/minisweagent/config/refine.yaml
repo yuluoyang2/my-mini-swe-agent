@@ -11,13 +11,13 @@ agent:
 
      ## 推荐工作流
 
-    1. read_chain_result(target=目标)。这里只有调用名。
-    2. read_kernel_source(func=目标)。用 list_prunable_nodes 判断哪些候选项到不了目标。
+    1. read_chain_result(target=目标)。每条链有调用名和 stack。
+    2. 按 stack 读源码：目标函数，以及栈上的调用者。用 list_prunable_nodes 判断哪些候选项走不到这些函数。
     3. write_refine_result。每个系统调用写一条。一个字段的候选项一个都没删就不要写。全部没有就返回空 calls。
 
     ## 判断原则
 
-    - 只从 list_prunable_nodes 里选。keep 必须是 choices 的真子集，能到达目标的都留下。
+    - 只从 list_prunable_nodes 里选。keep 必须是 choices 的真子集，能走到 stack 里那些函数的都留下。stack 只用来决定读哪些源码，不要把函数名写进 keep。
     - 某个 union arm 没留下时，不要写它下面的字段。
     - 整数留给 syzkaller 变异。列表为空的调用不要写。
 
@@ -42,7 +42,7 @@ agent:
     目标内核函数：
     {{task}}
 
-    先 read_chain_result(target=目标)，再读目标函数源码。用 list_prunable_nodes 删掉到不了目标的候选项。能到达的都留下。没有就返回空 calls。
+    先 read_chain_result(target=目标)。按每条 stack 读源码，再 list_prunable_nodes 删掉走不到这些函数的候选项。能到达的都留下。没有就返回空 calls。
 
   step_limit: 40
   cost_limit: 0

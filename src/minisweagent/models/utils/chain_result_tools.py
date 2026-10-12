@@ -6,6 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from minisweagent.models.utils.kernel_source_tools import read_json, source_dir
 from minisweagent.models.utils.syzlang_tools import is_refinable, read_syzlang_level
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -112,12 +113,31 @@ def validate_chain_result(target: str, chains: list[dict[str, Any]]) -> None:
             if not isinstance(step, dict) or not isinstance(step.get("call"), str) or not step["call"]:
                 raise ValueError(f"chains[{chain_index}].chain[{step_index}] must contain a non-empty call")
             validate_step_refinements(step, f"chains[{chain_index}].chain[{step_index}]")
-        evidence = record.get("evidence", [])
-        if evidence is not None and not isinstance(evidence, list):
-            raise ValueError(f"chains[{chain_index}].evidence must be a list when present")
+        if "evidence" in record:
+            raise ValueError(f"chains[{chain_index}] must not include evidence; write stack instead")
+        stack = record.get("stack")
+        if (
+            not isinstance(stack, list)
+            or not stack
+            or len(stack) > 3
+            or not all(isinstance(name, str) and name for name in stack)
+        ):
+            raise ValueError(f"chains[{chain_index}].stack must be 1 to 3 kernel function names")
+
+
+def validate_stack_names(chains: list[dict[str, Any]], *, data_root: Path) -> None:
+    index = read_json(str(source_dir(data_root) / "func.index.json"))
+    for chain_index, record in enumerate(chains):
+        missing = [name for name in record.get("stack") or [] if name not in index]
+        if missing:
+            raise ValueError(
+                f"chains[{chain_index}].stack contains functions not in the kernel source: {', '.join(missing)}. "
+                "Copy names from read_kernel_source."
+            )
 
 
 def validate_chain_semantics(chains: list[dict[str, Any]], *, data_root: Path) -> list[dict[str, Any]]:
+    validate_stack_names(chains, data_root=data_root)
     known = syscall_names(data_root)
     deps = syscall_deps(data_root)
     missing = sorted({
@@ -183,6 +203,23 @@ def validate_chain_semantics(chains: list[dict[str, Any]], *, data_root: Path) -
     return warnings
 
 
+def hops_from_stacks(target: str, chains: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    hop1: list[str] = []
+    outers: list[str] = []
+    for record in chains:
+        stack = record["stack"]
+        index = stack.index(target) if target in stack else 0
+        if index + 1 < len(stack) and stack[index + 1] not in hop1:
+            hop1.append(stack[index + 1])
+        if index + 2 < len(stack):
+            outers.append(stack[index + 2])
+    hop2 = []
+    for name in outers:
+        if name not in hop1 and name not in hop2:
+            hop2.append(name)
+    return [f"^{name}$" for name in hop1[:3]], [f"^{name}$" for name in hop2[:3]]
+
+
 def validate_fuzz_guidance(fuzz_guidance: dict[str, Any] | None) -> None:
     if fuzz_guidance is None:
         return
@@ -228,7 +265,11 @@ def write_chain_result(
     validate_chain_result(target, chains)
     reject_chain_refinements(chains)
     validation_warnings = validate_chain_semantics(chains, data_root=data_root)
-    validate_fuzz_guidance(fuzz_guidance)
+    guidance = dict(fuzz_guidance or {})
+    guidance["focus_hop1_functions"], guidance["focus_hop2_functions"] = hops_from_stacks(target, chains)
+    guidance.setdefault("focus_target_functions", [f"^{target}$"])
+    validate_fuzz_guidance(guidance)
+    fuzz_guidance = guidance
     output_path = Path(path) if path else output_dir / f"{safe_filename(target)}.chains.json"
     if not output_path.is_absolute():
         output_path = REPO_ROOT / output_path

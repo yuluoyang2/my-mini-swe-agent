@@ -369,7 +369,7 @@ WRITE_CHAIN_RESULT_TOOL = {
                 },
                 "chains": {
                     "type": "array",
-                    "description": "Evidence-supported candidate syscall chains, ordered by recommendation strength.",
+                    "description": "Candidate syscall chains, ordered by recommendation strength. Each chain includes its call stack.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -414,13 +414,14 @@ WRITE_CHAIN_RESULT_TOOL = {
                                     "required": ["call"],
                                 },
                             },
-                            "evidence": {
+                            "stack": {
                                 "type": "array",
+                                "maxItems": 3,
                                 "items": {"type": "string"},
-                                "description": "Short evidence strings supporting this chain.",
+                                "description": "At most 3 kernel function names: the target, its direct caller, and one caller above that. Names must come from read_kernel_source. Do not include syscalls.",
                             },
                         },
-                        "required": ["chain"],
+                        "required": ["chain", "stack"],
                     },
                 },
                 "path": {
@@ -439,12 +440,12 @@ WRITE_CHAIN_RESULT_TOOL = {
                         "focus_hop1_functions": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Regexes for functions that directly guide or dispatch to the target path. At most three items.",
+                            "description": "Ignored. Filled from stack frame 2, the direct caller of the target.",
                         },
                         "focus_hop2_functions": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Regexes for callers or protocol-entry functions one level above hop1. At most three items.",
+                            "description": "Ignored. Filled from stack frame 3, the caller of the direct caller.",
                         },
                         "focus_subsystem_files": {
                             "type": "array",
@@ -467,7 +468,10 @@ READ_CHAIN_RESULT_TOOL = {
     "type": "function",
     "function": {
         "name": "read_chain_result",
-        "description": "Read the written syscall call sequences for a target. Returns chains of call names only.",
+        "description": (
+            "Read the written syscall sequences and their call stacks. "
+            "Use each stack as the source-reading path: the target, its direct caller, and one caller above."
+        ),
         "parameters": {
             "type": "object",
             "properties": {

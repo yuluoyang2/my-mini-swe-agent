@@ -49,7 +49,10 @@ def read_chain_result(
     return {
         "target": source["target"],
         "chains": [
-            {"chain": [{"call": step["call"]} for step in record["chain"]]}
+            {
+                "chain": [{"call": step["call"]} for step in record["chain"]],
+                "stack": record["stack"],
+            }
             for record in source["chains"]
         ],
     }

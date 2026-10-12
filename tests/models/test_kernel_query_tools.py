@@ -107,6 +107,11 @@ def test_list_prunable_nodes_returns_named_choices_with_paths():
         for nodes in listed["calls"].values()
         for node in nodes
     )
+    xfrm = {
+        node["path"]: node
+        for node in list_prunable_nodes("sendmsg$nl_xfrm", data_root=DATA_ROOT)["calls"]["sendmsg$nl_xfrm"]
+    }
+    assert "allocspi" in xfrm["msg.vec.addr"]["choices"]
     with pytest.raises(ValueError, match="must not be empty"):
         list_prunable_nodes([], data_root=DATA_ROOT)
     with pytest.raises(ValueError, match="Unknown syzkaller syscall"):
@@ -150,14 +155,26 @@ def test_validate_chain_semantics_unknown_names_and_one_resource_group():
     with pytest.raises(ValueError, match="no satisfied resource-flow group"):
         validate_chain_semantics([{"chain": [{"call": "listen"}, {"call": "syz_emit_vhci"}]}], data_root=DATA_ROOT)
     with pytest.raises(ValueError, match="same calls and refinements"):
-        validate_chain_semantics([{"chain": sco, "evidence": ["acl"]}, {"chain": sco, "evidence": ["le"]}], data_root=DATA_ROOT)
+        validate_chain_semantics(
+            [{"chain": sco, "stack": ["l2cap_connect_cfm"]}, {"chain": sco, "stack": ["hci_connect_cfm"]}],
+            data_root=DATA_ROOT,
+        )
     with pytest.raises(ValueError, match="Unknown"):
         validate_chain_semantics([{"chain": [{"call": "socket$does_not_exist"}]}], data_root=DATA_ROOT)
     event = [{"call": "syz_init_net_socket$bt_l2cap"}, {"call": "syz_emit_vhci"}]
     assert validate_chain_semantics([{"chain": event}], data_root=DATA_ROOT) == []
-    validate_chain_result("t", [{"chain": event}])
+    validate_chain_result("t", [{"chain": event, "stack": ["le_conn_complete_evt", "l2cap_connect_cfm"]}])
+    with pytest.raises(ValueError, match="must not include evidence"):
+        validate_chain_result("t", [{"chain": event, "stack": ["l2cap_connect_cfm"], "evidence": ["acl"]}])
+    with pytest.raises(ValueError, match="1 to 3"):
+        validate_chain_result("t", [{"chain": event, "stack": ["l2cap_connect_cfm", "hci_connect_cfm", "le_conn_complete_evt", "hci_le_conn_complete_evt"]}])
+    with pytest.raises(ValueError, match="not in the kernel source"):
+        validate_chain_semantics([{"chain": event, "stack": ["syz_emit_vhci"]}], data_root=DATA_ROOT)
     with pytest.raises(ValueError, match="same calls and refinements"):
-        validate_chain_semantics([{"chain": event, "evidence": ["a"]}, {"chain": event, "evidence": ["b"]}], data_root=DATA_ROOT)
+        validate_chain_semantics(
+            [{"chain": event, "stack": ["l2cap_connect_cfm"]}, {"chain": event, "stack": ["hci_connect_cfm"]}],
+            data_root=DATA_ROOT,
+        )
     with pytest.raises(ValueError, match="must use refinements instead of params"):
         validate_chain_result("t", [{"chain": [{"call": "syz_emit_vhci", "params": [{"kind": "union", "path": "pkt.EVT_A"}]}]}])
 
@@ -219,6 +236,7 @@ def test_kernel_environment_rejects_bash_and_finishes_on_write(tmp_path):
                     "target": "nr_add_node",
                     "chains": [
                         {
+                            "stack": ["nr_add_node"],
                             "chain": [
                                 {"call": "syz_init_net_socket$netrom"},
                                 {"call": "ioctl$sock_netrom_SIOCADDRT"},
@@ -266,14 +284,24 @@ def test_refine_result_keeps_the_written_call_sequence(tmp_path):
     chains = [{"chain": [{"call": "syz_init_net_socket$bt_l2cap"}, {"call": "syz_emit_vhci"}]}]
     write_chain_result(
         "l2cap_connect_cfm",
-        [{"evidence": ["acl conn complete"], **record} for record in chains],
+        [{"stack": ["l2cap_connect_cfm", "hci_connect_cfm", "le_conn_complete_evt"], **record} for record in chains],
         path=str(chain_path),
-        fuzz_guidance={"focus_target_functions": ["^l2cap_connect_cfm$"]},
+        fuzz_guidance={
+            "focus_target_functions": ["^l2cap_connect_cfm$"],
+            "focus_hop1_functions": ["^hci_rx_work$"],
+            "focus_hop2_functions": ["^hci_event_packet$"],
+        },
         data_root=DATA_ROOT,
     )
+    guidance = json.loads(chain_path.read_text())["fuzz_guidance"]
+    assert guidance["focus_hop1_functions"] == ["^hci_connect_cfm$"]
+    assert guidance["focus_hop2_functions"] == ["^le_conn_complete_evt$"]
     visible = read_chain_result("l2cap_connect_cfm", path=str(chain_path), data_root=DATA_ROOT)
     assert visible.keys() == {"target", "chains"}
-    assert visible["chains"] == chains
+    assert visible["chains"] == [
+        {"stack": ["l2cap_connect_cfm", "hci_connect_cfm", "le_conn_complete_evt"], **record}
+        for record in chains
+    ]
     kept = [{
         "call": "syz_emit_vhci",
         "refinements": [{
@@ -303,7 +331,7 @@ def test_refine_result_keeps_the_written_call_sequence(tmp_path):
     with pytest.raises(ValueError, match="must not include refinements"):
         write_chain_result(
             "l2cap_connect_cfm",
-            [{"chain": kept}],
+            [{"chain": kept, "stack": ["l2cap_connect_cfm"]}],
             path=str(tmp_path / "rejected.json"),
             data_root=DATA_ROOT,
         )

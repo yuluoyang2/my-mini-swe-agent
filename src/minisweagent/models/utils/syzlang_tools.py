@@ -296,13 +296,23 @@ def parse_type_definition(source: str, name: str) -> tuple[list[str], str]:
     return params, rest
 
 
+def _non_const(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next((record for record in records if record.get("kind") != "const"), records[0] if records else None)
+
+
 def definition_for(
     name: str,
     index: dict[str, list[dict[str, Any]]],
     root_file: str,
 ) -> dict[str, Any] | None:
-    records = [record for record in index.get(name, []) if same_file_family(record["file"], root_file)]
-    return next((record for record in records if record.get("kind") != "const"), records[0] if records else None)
+    records = index.get(name, [])
+    local = [record for record in records if same_file_family(record["file"], root_file)]
+    if local:
+        return _non_const(local)
+    others = [record for record in records if record.get("kind") != "const"]
+    if len({record["file"] for record in others}) == 1:
+        return others[0]
+    return None
 
 
 def resolve_syzlang_node(
