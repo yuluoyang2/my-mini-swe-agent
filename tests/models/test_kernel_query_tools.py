@@ -9,7 +9,7 @@ from minisweagent.models.utils.actions_toolcall import get_tool_specs
 from minisweagent.models.utils.callgraph_tools import func_bfs
 from minisweagent.models.utils.fuzzing_coverage_tools import get_fuzz_coverage
 from minisweagent.models.utils.kernel_source_tools import lookup_ops, read_kernel_source
-from minisweagent.models.utils.chain_result_tools import validate_chain_result, validate_chain_semantics, write_chain_result
+from minisweagent.models.utils.chain_result_tools import hops_from_stacks, validate_chain_result, validate_chain_semantics, write_chain_result
 from minisweagent.models.utils.refine_result_tools import read_chain_result, write_refine_result
 from minisweagent.models.utils.syzlang_tools import get_syscall_deps, list_prunable_nodes, read_syzlang_def
 
@@ -294,8 +294,14 @@ def test_refine_result_keeps_the_written_call_sequence(tmp_path):
         data_root=DATA_ROOT,
     )
     guidance = json.loads(chain_path.read_text())["fuzz_guidance"]
-    assert guidance["focus_hop1_functions"] == ["^hci_connect_cfm$"]
-    assert guidance["focus_hop2_functions"] == ["^le_conn_complete_evt$"]
+    assert guidance["focus_hop1_functions"] == ["^le_conn_complete_evt$"]
+    assert guidance["focus_hop2_functions"] == []
+    rose = [
+        {"stack": ["rose_transmit_link", "rose_write_internal", "rose_connect"], "chain": [{"call": "connect$rose"}]},
+        {"stack": ["rose_transmit_link", "rose_kick", "rose_sendmsg"], "chain": [{"call": "sendto$rose"}]},
+        {"stack": ["rose_transmit_link", "rose_write_internal", "rose_ioctl"], "chain": [{"call": "ioctl$SIOCRSACCEPT"}]},
+    ]
+    assert hops_from_stacks("rose_transmit_link", rose, data_root=DATA_ROOT) == (["^rose_connect$"], [])
     visible = read_chain_result("l2cap_connect_cfm", path=str(chain_path), data_root=DATA_ROOT)
     assert visible.keys() == {"target", "chains"}
     assert visible["chains"] == [

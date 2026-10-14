@@ -203,21 +203,76 @@ def validate_chain_semantics(chains: list[dict[str, Any]], *, data_root: Path) -
     return warnings
 
 
-def hops_from_stacks(target: str, chains: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+def _function_sources(name: str, data_root: Path) -> list[str]:
+    records = read_json(str(data_root / "source/func.index.json")).get(name, [])
+    return [record["source"] for record in records if record.get("source")]
+
+
+def _ops_fields(handler: str, data_root: Path) -> list[str]:
+    records = read_json(str(data_root / "source/ops.index.json")).get("by_handler", {}).get(handler, [])
+    return [record["field"] for record in records if record.get("field")]
+
+
+def _call_at(source: str, callee: str, data_root: Path) -> int | None:
+    match = re.search(rf"\b{re.escape(callee)}\s*\(", source)
+    if match:
+        return match.start()
+    for field in _ops_fields(callee, data_root):
+        match = re.search(rf"(?:->|\.){re.escape(field)}\s*\(", source)
+        if match:
+            return match.start()
+    return None
+
+
+def _inside_switch(source: str, pos: int) -> bool:
+    depth = 0
+    switch_depths: list[int] = []
+    pending = False
+    head = source[:pos]
+    index = 0
+    while index < len(head):
+        if re.match(r"switch\b", head[index:]) and not (index and (head[index - 1].isalnum() or head[index - 1] == "_")):
+            pending = True
+            index += len("switch")
+            continue
+        char = head[index]
+        if char == "{":
+            depth += 1
+            if pending:
+                switch_depths.append(depth)
+                pending = False
+        elif char == "}":
+            if depth in switch_depths:
+                switch_depths.remove(depth)
+            depth = max(0, depth - 1)
+            pending = False
+        index += 1
+    return bool(switch_depths)
+
+
+def _approach_function(stack: list[str], target: str, data_root: Path) -> str | None:
+    frames = stack[stack.index(target):] if target in stack else stack
+    approach = None
+    for index in range(1, len(frames)):
+        texts = _function_sources(frames[index], data_root)
+        site = next((found for text in texts if (found := _call_at(text, frames[index - 1], data_root)) is not None), None)
+        if site is None:
+            break
+        body = next(text for text in texts if _call_at(text, frames[index - 1], data_root) == site)
+        if _inside_switch(body, site):
+            continue
+        if re.search(r"\breturn\s+\S|\bgoto\s+\w+", body[:site]):
+            approach = frames[index]
+    return approach
+
+
+def hops_from_stacks(target: str, chains: list[dict[str, Any]], *, data_root: Path) -> tuple[list[str], list[str]]:
     hop1: list[str] = []
-    outers: list[str] = []
     for record in chains:
-        stack = record["stack"]
-        index = stack.index(target) if target in stack else 0
-        if index + 1 < len(stack) and stack[index + 1] not in hop1:
-            hop1.append(stack[index + 1])
-        if index + 2 < len(stack):
-            outers.append(stack[index + 2])
-    hop2 = []
-    for name in outers:
-        if name not in hop1 and name not in hop2:
-            hop2.append(name)
-    return [f"^{name}$" for name in hop1[:3]], [f"^{name}$" for name in hop2[:3]]
+        name = _approach_function(record["stack"], target, data_root)
+        if name and name not in hop1:
+            hop1.append(name)
+    return [f"^{name}$" for name in hop1[:3]], []
 
 
 def validate_fuzz_guidance(fuzz_guidance: dict[str, Any] | None) -> None:
@@ -266,7 +321,7 @@ def write_chain_result(
     reject_chain_refinements(chains)
     validation_warnings = validate_chain_semantics(chains, data_root=data_root)
     guidance = dict(fuzz_guidance or {})
-    guidance["focus_hop1_functions"], guidance["focus_hop2_functions"] = hops_from_stacks(target, chains)
+    guidance["focus_hop1_functions"], guidance["focus_hop2_functions"] = hops_from_stacks(target, chains, data_root=data_root)
     guidance.setdefault("focus_target_functions", [f"^{target}$"])
     validate_fuzz_guidance(guidance)
     fuzz_guidance = guidance

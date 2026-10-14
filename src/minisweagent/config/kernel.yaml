@@ -37,7 +37,7 @@ agent:
     - 不要提交调用序列完全相同的重复 chains。参数不同也不要在这一阶段拆成多条 chain。
     - fuzz_guidance 用于后续 fuzzing 引导，函数项用精确匹配正则，例如 "^func$"。
     - focus_target_functions 最多 1 个，通常是 "^目标函数$"。
-    - 不要填 focus_hop1_functions 和 focus_hop2_functions。写入时按 stack 生成：第 2 个名字是一跳，第 3 个是二跳。
+    - 不要填 focus_hop1_functions 和 focus_hop2_functions。写入时从 stack 选择：外层函数直接调用下一层，并且这次调用前会离开函数，才作为一跳。对不上的不写。
     - focus_subsystem_files 只保留一个，跟目标函数有关的核心c文件，只能是 .c，不要 .h。
     - 完成分析后调用 write_chain_result 写入同一份 JSON，校验通过即结束。默认路径 data/linux-6.6/results/<target>.chains.json。
 
