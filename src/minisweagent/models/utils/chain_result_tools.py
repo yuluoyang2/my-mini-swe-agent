@@ -44,12 +44,20 @@ def syscall_deps(data_root: Path) -> dict[str, dict[str, Any]]:
     }
 
 
-def step_calls(chain: list[dict[str, Any]]) -> list[str]:
-    return [step["call"] for step in chain]
+def call_name(step: str | dict[str, Any]) -> str:
+    return step if isinstance(step, str) else step["call"]
 
 
-def step_fingerprint(step: dict[str, Any]) -> str:
-    return json.dumps(step, sort_keys=True, ensure_ascii=False)
+def step_calls(chain: list[str | dict[str, Any]]) -> list[str]:
+    return [call_name(step) for step in chain]
+
+
+def step_fingerprint(step: str | dict[str, Any]) -> str:
+    return json.dumps(
+        {"call": call_name(step), "refinements": step.get("refinements", []) if isinstance(step, dict) else []},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
 
 
 def validate_step_refinements(step: dict[str, Any], loc: str) -> None:
@@ -110,19 +118,22 @@ def validate_chain_result(target: str, chains: list[dict[str, Any]]) -> None:
         if not isinstance(chain, list) or not chain:
             raise ValueError(f"chains[{chain_index}].chain must be a non-empty list")
         for step_index, step in enumerate(chain):
-            if not isinstance(step, dict) or not isinstance(step.get("call"), str) or not step["call"]:
-                raise ValueError(f"chains[{chain_index}].chain[{step_index}] must contain a non-empty call")
-            validate_step_refinements(step, f"chains[{chain_index}].chain[{step_index}]")
+            if isinstance(step, str) and step:
+                continue
+            if isinstance(step, dict) and isinstance(step.get("call"), str) and step["call"]:
+                validate_step_refinements(step, f"chains[{chain_index}].chain[{step_index}]")
+                continue
+            raise ValueError(f"chains[{chain_index}].chain[{step_index}] must contain a non-empty call")
         if "evidence" in record:
             raise ValueError(f"chains[{chain_index}] must not include evidence; write stack instead")
         stack = record.get("stack")
         if (
             not isinstance(stack, list)
             or not stack
-            or len(stack) > 3
+            or len(stack) > 4
             or not all(isinstance(name, str) and name for name in stack)
         ):
-            raise ValueError(f"chains[{chain_index}].stack must be 1 to 3 kernel function names")
+            raise ValueError(f"chains[{chain_index}].stack must be 1 to 4 kernel function names")
 
 
 def validate_stack_names(chains: list[dict[str, Any]], *, data_root: Path) -> None:
@@ -141,10 +152,10 @@ def validate_chain_semantics(chains: list[dict[str, Any]], *, data_root: Path) -
     known = syscall_names(data_root)
     deps = syscall_deps(data_root)
     missing = sorted({
-        step["call"]
+        call_name(step)
         for record in chains
         for step in record["chain"]
-        if step["call"] not in known
+        if call_name(step) not in known
     })
     if missing:
         raise ValueError(
@@ -155,6 +166,8 @@ def validate_chain_semantics(chains: list[dict[str, Any]], *, data_root: Path) -
 
     for chain_index, record in enumerate(chains):
         for step_index, step in enumerate(record["chain"]):
+            if isinstance(step, str):
+                continue
             for refinement_index, refinement in enumerate(step.get("refinements", [])):
                 loc = f"chains[{chain_index}].chain[{step_index}].refinements[{refinement_index}]"
                 level = read_syzlang_level(step["call"], refinement["path"], data_root=data_root)
@@ -208,71 +221,86 @@ def _function_sources(name: str, data_root: Path) -> list[str]:
     return [record["source"] for record in records if record.get("source")]
 
 
+def _function_files(name: str, data_root: Path) -> list[str]:
+    records = read_json(str(data_root / "source/func.index.json")).get(name, [])
+    return [
+        record["file"]
+        for record in records
+        if record.get("file") and Path(record["file"]).suffix == ".c"
+    ]
+
+
+def _source_edge(caller: str, callee: str, data_root: Path) -> bool:
+    fields = _ops_fields(callee, data_root)
+    return any(
+        re.search(rf"\b{re.escape(callee)}\s*\(", source)
+        or any(re.search(rf"(?:->|\.){re.escape(field)}\s*\(", source) for field in fields)
+        for source in _function_sources(caller, data_root)
+    )
+
+
+def validate_focus_candidates(
+    target: str,
+    chains: list[dict[str, Any]],
+    guidance: dict[str, Any] | None,
+    *,
+    data_root: Path,
+) -> tuple[list[str], list[str]]:
+    if guidance is None:
+        guidance = {}
+    if not isinstance(guidance, dict):
+        raise ValueError("fuzz_guidance must be an object")
+    unknown = set(guidance) - {"near_functions", "path_functions"}
+    if unknown:
+        raise ValueError(f"fuzz_guidance contains unsupported fields: {', '.join(sorted(unknown))}")
+    near = guidance.get("near_functions", [])
+    upstream = guidance.get("path_functions", [])
+    index = read_json(str(source_dir(data_root) / "func.index.json"))
+    for key, names in (("near_functions", near), ("path_functions", upstream)):
+        if not isinstance(names, list) or len(names) > 3 or not all(isinstance(name, str) and name in index for name in names):
+            raise ValueError(f"fuzz_guidance.{key} must contain at most 3 kernel function names from the source index")
+        if len(names) != len(set(names)) or target in names:
+            raise ValueError(f"fuzz_guidance.{key} must not repeat functions or contain the target")
+    if set(near) & set(upstream):
+        raise ValueError("B and C focus functions must not overlap")
+    near_paths: list[str] = []
+    upstream_paths: set[str] = set()
+    for record in chains:
+        stack = record["stack"]
+        if stack[0] != target:
+            raise ValueError("each stack must start with the target function")
+        for distance, name in enumerate(stack[1:], start=1):
+            if distance >= 3:
+                upstream_paths.add(name)
+            if distance > 2 or not _source_edge(name, stack[distance - 1], data_root):
+                break
+            if name not in near_paths:
+                near_paths.append(name)
+    invalid_near = set(near) - set(near_paths)
+    if invalid_near:
+        raise ValueError(f"B focus functions must be source-linked callers within 2 steps: {', '.join(sorted(invalid_near))}")
+    if not near:
+        near = near_paths[:1]
+    if not near:
+        raise ValueError("near_functions needs a source-linked caller within 2 steps; extend the stack")
+    ops = read_json(str(source_dir(data_root) / "ops.index.json")).get("by_handler", {})
+    target_tables = {record["table_key"] for record in ops.get(target, []) if record.get("table_key")}
+    linked_callbacks = {
+        name for name in upstream
+        if target_tables & {record["table_key"] for record in ops.get(name, []) if record.get("table_key")}
+    }
+    invalid_upstream = set(upstream) - upstream_paths - linked_callbacks
+    if invalid_upstream:
+        raise ValueError(
+            "C focus functions must be upstream stack functions or callbacks of the target's driver: "
+            + ", ".join(sorted(invalid_upstream))
+        )
+    return near, upstream
+
+
 def _ops_fields(handler: str, data_root: Path) -> list[str]:
     records = read_json(str(data_root / "source/ops.index.json")).get("by_handler", {}).get(handler, [])
     return [record["field"] for record in records if record.get("field")]
-
-
-def _call_at(source: str, callee: str, data_root: Path) -> int | None:
-    match = re.search(rf"\b{re.escape(callee)}\s*\(", source)
-    if match:
-        return match.start()
-    for field in _ops_fields(callee, data_root):
-        match = re.search(rf"(?:->|\.){re.escape(field)}\s*\(", source)
-        if match:
-            return match.start()
-    return None
-
-
-def _inside_switch(source: str, pos: int) -> bool:
-    depth = 0
-    switch_depths: list[int] = []
-    pending = False
-    head = source[:pos]
-    index = 0
-    while index < len(head):
-        if re.match(r"switch\b", head[index:]) and not (index and (head[index - 1].isalnum() or head[index - 1] == "_")):
-            pending = True
-            index += len("switch")
-            continue
-        char = head[index]
-        if char == "{":
-            depth += 1
-            if pending:
-                switch_depths.append(depth)
-                pending = False
-        elif char == "}":
-            if depth in switch_depths:
-                switch_depths.remove(depth)
-            depth = max(0, depth - 1)
-            pending = False
-        index += 1
-    return bool(switch_depths)
-
-
-def _approach_function(stack: list[str], target: str, data_root: Path) -> str | None:
-    frames = stack[stack.index(target):] if target in stack else stack
-    approach = None
-    for index in range(1, len(frames)):
-        texts = _function_sources(frames[index], data_root)
-        site = next((found for text in texts if (found := _call_at(text, frames[index - 1], data_root)) is not None), None)
-        if site is None:
-            break
-        body = next(text for text in texts if _call_at(text, frames[index - 1], data_root) == site)
-        if _inside_switch(body, site):
-            continue
-        if re.search(r"\breturn\s+\S|\bgoto\s+\w+", body[:site]):
-            approach = frames[index]
-    return approach
-
-
-def hops_from_stacks(target: str, chains: list[dict[str, Any]], *, data_root: Path) -> tuple[list[str], list[str]]:
-    hop1: list[str] = []
-    for record in chains:
-        name = _approach_function(record["stack"], target, data_root)
-        if name and name not in hop1:
-            hop1.append(name)
-    return [f"^{name}$" for name in hop1[:3]], []
 
 
 def validate_fuzz_guidance(fuzz_guidance: dict[str, Any] | None) -> None:
@@ -281,27 +309,31 @@ def validate_fuzz_guidance(fuzz_guidance: dict[str, Any] | None) -> None:
     if not isinstance(fuzz_guidance, dict):
         raise ValueError("fuzz_guidance must be an object when present")
     limits = {
-        "focus_target_functions": 1,
-        "focus_hop1_functions": 3,
-        "focus_hop2_functions": 3,
-        "focus_subsystem_files": 3,
+        "target_function": 1,
+        "near_functions": 3,
+        "path_functions": 3,
+        "target_file": 1,
     }
+    if set(fuzz_guidance) != set(limits):
+        raise ValueError("fuzz_guidance must contain exactly the target, B, C, and target file fields")
     for key, limit in limits.items():
         value = fuzz_guidance.get(key, [])
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise ValueError(f"fuzz_guidance.{key} must be a list of strings")
         if len(value) > limit:
             raise ValueError(f"fuzz_guidance.{key} must contain at most {limit} items")
-    for path in fuzz_guidance.get("focus_subsystem_files", []):
+    if not fuzz_guidance["near_functions"]:
+        raise ValueError("fuzz_guidance.near_functions must not be empty")
+    for path in fuzz_guidance.get("target_file", []):
         if Path(path).suffix in {".h", ".hpp", ".hh", ".hxx"}:
-            raise ValueError("fuzz_guidance.focus_subsystem_files must not contain header files")
+            raise ValueError("fuzz_guidance.target_file must not contain header files")
 
 
 
 def reject_chain_refinements(chains: list[dict[str, Any]]) -> None:
     for chain_index, record in enumerate(chains):
         for step_index, step in enumerate(record["chain"]):
-            if step.get("refinements"):
+            if isinstance(step, dict) and step.get("refinements"):
                 raise ValueError(
                     f"chains[{chain_index}].chain[{step_index}] must not include refinements; "
                     "write the call sequence first, then refine parameters from that fixed chain"
@@ -320,16 +352,23 @@ def write_chain_result(
     validate_chain_result(target, chains)
     reject_chain_refinements(chains)
     validation_warnings = validate_chain_semantics(chains, data_root=data_root)
-    guidance = dict(fuzz_guidance or {})
-    guidance["focus_hop1_functions"], guidance["focus_hop2_functions"] = hops_from_stacks(target, chains, data_root=data_root)
-    guidance.setdefault("focus_target_functions", [f"^{target}$"])
+    hop1, hop2 = validate_focus_candidates(target, chains, fuzz_guidance, data_root=data_root)
+    target_files = sorted(set(_function_files(target, data_root)))
+    if len(target_files) != 1:
+        raise ValueError(f"target {target} must have exactly one defining .c file, found: {target_files}")
+    guidance = {
+        "target_function": [f"^{re.escape(target)}$"],
+        "near_functions": [f"^{re.escape(name)}$" for name in hop1],
+        "path_functions": [f"^{re.escape(name)}$" for name in hop2],
+        "target_file": target_files,
+    }
     validate_fuzz_guidance(guidance)
     fuzz_guidance = guidance
     output_path = Path(path) if path else output_dir / f"{safe_filename(target)}.chains.json"
     if not output_path.is_absolute():
         output_path = REPO_ROOT / output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    result = {"target": target, "chains": chains}
+    result = {"target": target, "chains": [{**record, "chain": step_calls(record["chain"])} for record in chains]}
     if fuzz_guidance is not None:
         result["fuzz_guidance"] = fuzz_guidance
     output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")

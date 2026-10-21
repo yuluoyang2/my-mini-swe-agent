@@ -5,40 +5,43 @@ agent:
 
     使用已注册的 callgraph、kernel_source、syzlang、fuzzing_coverage 和 chain_result 工具。
 
-    1. read_kernel_source(func=目标)。先推断调用栈，最多 3 层：目标函数、直接调用它的函数、再上一层。只写源码里看到的函数名，没看到的不要写。不要写 syscall。函数开头就 return 的路径不要算进来。可能有多条栈。调用图只是提示，栈以源码为准。
+    1. read_kernel_source(func=目标)。先推断调用栈，最多 4 层：目标函数、直接调用它的函数、以及继续往上的调用者。只写源码里看到的函数，不要写 syscall。函数开头就 return 的路径不要算进来。可能有多条栈。调用图只是提示，栈以源码为准。
     2. 用这些栈、覆盖和源码确定关键调用。名字必须来自真实 syzlang。覆盖只说明它命中过目标，不说明单独它就能深入覆盖。
-    3. 沿同一条资源流补状态。显式资源用 get_syscall_deps，生产者排在消费者前面。一条资源流是这条依赖上从生产者到消费者的调用。另一条资源流、以及没有 fd 依赖的调用，各写一条 chain，不要接到同一条后面。
-    4. write_chain_result。每条 chain 的 stack 最多 3 个函数名。这一阶段只写 call，不要写 refinements，不要写 evidence。
+    3. 沿同一条资源流补状态。显式资源用 get_syscall_deps，生产者排在消费者前面。如果触发调用（如伪系统调用或另一对象操作）依赖前置 socket/设备/子系统状态，必须把前置状态构造调用排在同一条 chain 的前面；只有完全独立的不同触发路径才拆成多条 chain。
+    4. write_chain_result。每条 chain 是按执行顺序排列的 syscall 名称字符串数组，stack 最多 4 个函数名。fuzz_guidance 只传 B/C 两组函数原名，不加正则；目标函数和目标所在 .c 文件由写入工具固定生成。
 
     普通函数可以沿 caller 追踪入口。ops、work、timer 等间接回调先找注册或调度位置，再追到 syscall。
-    一条 chain 只沿一条资源流。同一个 syscall 不要在一条 chain 里重复。
+    B 不可留空。选择之前推断的调用栈上离目标最近的的函数。 在选择上最好与目标函数属一个子系统
+    C 选同一触发路径上更上游的关键派发函数或目标所属驱动中必需的前置状态回调。前置函数被调用不等于状态构造成功，证据不足时留空。B/C 不要重复。
+    除非需要通过同一 syscall 的不同命令或参数分步推进状态（如先创建对象、再修改或删除对象），否则不要在一条 chain 里无意义重复同一个 syscall。
     文件系统里不可生成的调用，只保留核心调用。
 
-    ## 输出格式
+    ## 写入文件的格式
 
-    最终结果必须是 JSON 对象，每条候选链带上推断出的调用栈，按推荐强度排序：
+    每条候选链带上推断出的调用栈，按推荐强度排序。下面是工具写入后的 JSON；调用 write_chain_result 时，fuzz_guidance 只提交 B/C 的函数原名：
 
     ```json
     {
       "target": "target_function",
       "chains": [
         {
-          "stack": ["l2cap_connect_cfm", "hci_connect_cfm", "le_conn_complete_evt"],
-          "chain": [
-            {"call": "syscall$setup"},
-            {"call": "syscall$trigger"}
-          ]
+          "stack": ["target_function", "func_A", "func_B", "func_C"],
+          "chain": ["syscall$setup", "syscall$trigger"]
         }
       ],
-      "fuzz_guidance": {}
+      "fuzz_guidance": {
+        "target_function": ["^target_function$"],
+        "near_functions": ["^func_A$"],
+        "path_functions": ["^func_C$"],
+        "target_file": ["kernel/example.c"]
+      }
     }
     ```
 
-    - 不要提交调用序列完全相同的重复 chains。参数不同也不要在这一阶段拆成多条 chain。
+    - 不要提交调用序列完全相同的重复 chains。
     - fuzz_guidance 用于后续 fuzzing 引导，函数项用精确匹配正则，例如 "^func$"。
-    - focus_target_functions 最多 1 个，通常是 "^目标函数$"。
-    - 不要填 focus_hop1_functions 和 focus_hop2_functions。写入时从 stack 选择：外层函数直接调用下一层，并且这次调用前会离开函数，才作为一跳。对不上的不写。
-    - focus_subsystem_files 只保留一个，跟目标函数有关的核心c文件，只能是 .c，不要 .h。
+    - 调用 write_chain_result 时只填 near_functions 和 path_functions，使用源码中的函数原名。输出文件中的函数名由写入工具转为精确匹配正则。
+    - target_function 只取目标函数，target_file 只取目标函数定义所在的 .c 文件，两者都由写入工具生成。
     - 完成分析后调用 write_chain_result 写入同一份 JSON，校验通过即结束。默认路径 data/linux-6.6/results/<target>.chains.json。
 
     每轮回复必须包含至少一个工具调用。完成时调用 write_chain_result，不要再调其他工具。
@@ -47,13 +50,13 @@ agent:
     目标内核函数：
     {{task}}
 
-    先根据源码推断能走进目标内部的调用栈，再找到能命中目标函数的关键调用。一条 chain 只沿一条资源流补状态，还有别的资源流就另写一条。不要因为覆盖里没出现就把这些状态调用删掉。
+    先根据源码推断能走进目标内部的调用栈，再找到能命中目标函数的关键调用。围绕每条触发路径补齐必需的前置状态调用（包括显式 fd 依赖与隐式状态初始化），不同触发路径分写多条 chain。不要因为覆盖里没出现就把这些状态调用删掉。
 
   step_limit: 30
   cost_limit: 0
   force_final_on_step_limit: true
   force_final_template: |
-    步数已用尽。不要再调用查询工具。立刻调用 write_chain_result 写入目前最可信的 chains。每条 stack 最多 3 个源码里的函数名，不要写 evidence，不要空交。
+    步数已用尽。不要再调用查询工具。立刻调用 write_chain_result 写入目前最可信的 chains。每条 stack 最多 4 个源码里的函数名，须包含目标的调用者以生成非空的 B；不要写 evidence，不要空交。
 
 environment:
   environment_class: kernel

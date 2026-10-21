@@ -18,7 +18,7 @@ def refinements(document: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     elif "calls" in document:
         records = document["calls"]
     else:
-        records = [step for record in document["chains"] for step in record["chain"]]
+        records = [step for record in document["chains"] for step in record["chain"] if isinstance(step, dict)]
     return [
         (record["call"], refinement)
         for record in records

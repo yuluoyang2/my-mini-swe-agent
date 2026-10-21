@@ -9,7 +9,7 @@ from minisweagent.models.utils.actions_toolcall import get_tool_specs
 from minisweagent.models.utils.callgraph_tools import func_bfs
 from minisweagent.models.utils.fuzzing_coverage_tools import get_fuzz_coverage
 from minisweagent.models.utils.kernel_source_tools import lookup_ops, read_kernel_source
-from minisweagent.models.utils.chain_result_tools import hops_from_stacks, validate_chain_result, validate_chain_semantics, write_chain_result
+from minisweagent.models.utils.chain_result_tools import validate_chain_result, validate_chain_semantics, validate_focus_candidates, write_chain_result
 from minisweagent.models.utils.refine_result_tools import read_chain_result, write_refine_result
 from minisweagent.models.utils.syzlang_tools import get_syscall_deps, list_prunable_nodes, read_syzlang_def
 
@@ -42,6 +42,10 @@ def test_kernel_tool_groups_are_collapsed():
         "read_chain_result",
         "write_refine_result",
     ]
+    chain_spec = get_tool_specs(["chain_result"])[0]["function"]["parameters"]["properties"]["chains"]["items"]["properties"]["chain"]
+    assert chain_spec["items"] == {"type": "string", "minLength": 1}
+    guidance_spec = get_tool_specs(["chain_result"])[0]["function"]["parameters"]["properties"]["fuzz_guidance"]["properties"]
+    assert list(guidance_spec) == ["near_functions", "path_functions"]
 
 
 def test_func_bfs_defaults_to_reverse_and_attaches_caller_source():
@@ -161,13 +165,16 @@ def test_validate_chain_semantics_unknown_names_and_one_resource_group():
         )
     with pytest.raises(ValueError, match="Unknown"):
         validate_chain_semantics([{"chain": [{"call": "socket$does_not_exist"}]}], data_root=DATA_ROOT)
+    with pytest.raises(ValueError, match="Unknown"):
+        validate_chain_semantics([{"chain": ["socket$does_not_exist"]}], data_root=DATA_ROOT)
     event = [{"call": "syz_init_net_socket$bt_l2cap"}, {"call": "syz_emit_vhci"}]
     assert validate_chain_semantics([{"chain": event}], data_root=DATA_ROOT) == []
     validate_chain_result("t", [{"chain": event, "stack": ["le_conn_complete_evt", "l2cap_connect_cfm"]}])
+    validate_chain_result("t", [{"chain": event, "stack": ["l2cap_connect_cfm", "hci_connect_cfm", "le_conn_complete_evt", "hci_le_meta_evt"]}])
     with pytest.raises(ValueError, match="must not include evidence"):
         validate_chain_result("t", [{"chain": event, "stack": ["l2cap_connect_cfm"], "evidence": ["acl"]}])
-    with pytest.raises(ValueError, match="1 to 3"):
-        validate_chain_result("t", [{"chain": event, "stack": ["l2cap_connect_cfm", "hci_connect_cfm", "le_conn_complete_evt", "hci_le_conn_complete_evt"]}])
+    with pytest.raises(ValueError, match="1 to 4"):
+        validate_chain_result("t", [{"chain": event, "stack": ["l2cap_connect_cfm", "hci_connect_cfm", "le_conn_complete_evt", "hci_le_meta_evt", "hci_event_packet"]}])
     with pytest.raises(ValueError, match="not in the kernel source"):
         validate_chain_semantics([{"chain": event, "stack": ["syz_emit_vhci"]}], data_root=DATA_ROOT)
     with pytest.raises(ValueError, match="same calls and refinements"):
@@ -236,11 +243,8 @@ def test_kernel_environment_rejects_bash_and_finishes_on_write(tmp_path):
                     "target": "nr_add_node",
                     "chains": [
                         {
-                            "stack": ["nr_add_node"],
-                            "chain": [
-                                {"call": "syz_init_net_socket$netrom"},
-                                {"call": "ioctl$sock_netrom_SIOCADDRT"},
-                            ]
+                            "stack": ["nr_add_node", "nr_rt_ioctl"],
+                            "chain": ["syz_init_net_socket$netrom", "ioctl$sock_netrom_SIOCADDRT"],
                         }
                     ],
                     "path": str(out_file),
@@ -279,35 +283,80 @@ def test_kernel_environment_rejects_bash_and_finishes_on_write(tmp_path):
     assert refine_file.exists()
 
 
+def test_focus_guidance_uses_target_file_and_source_linked_path_functions(tmp_path):
+    hdm = [{
+        "stack": ["hdm_disconnect", "usb_unbind_interface", "__device_release_driver"],
+        "chain": ["syz_usb_connect", "syz_usb_disconnect"],
+    }]
+    path = tmp_path / "hdm.chains.json"
+    write_chain_result(
+        "hdm_disconnect",
+        hdm,
+        fuzz_guidance={"near_functions": [], "path_functions": ["hdm_probe"]},
+        path=str(path),
+        data_root=DATA_ROOT,
+    )
+    assert json.loads(path.read_text())["fuzz_guidance"] == {
+        "target_function": ["^hdm_disconnect$"],
+        "near_functions": ["^usb_unbind_interface$"],
+        "path_functions": ["^hdm_probe$"],
+        "target_file": ["drivers/most/most_usb.c"],
+    }
+    with pytest.raises(ValueError, match="source-linked callers within 2 steps"):
+        validate_focus_candidates(
+            "hdm_disconnect", hdm, {"near_functions": ["__device_release_driver"]}, data_root=DATA_ROOT,
+        )
+    with pytest.raises(ValueError, match="needs a source-linked caller"):
+        validate_focus_candidates("hdm_disconnect", [{"stack": ["hdm_disconnect"]}], None, data_root=DATA_ROOT)
+    with pytest.raises(ValueError, match="unsupported fields"):
+        validate_focus_candidates(
+            "hdm_disconnect", hdm, {"focus_hop1_functions": ["usb_unbind_interface"]}, data_root=DATA_ROOT,
+        )
+    sco = [{
+        "stack": ["sco_chan_del", "sco_conn_del", "sco_disconn_cfm", "hci_disconn_complete_evt"],
+    }]
+    assert validate_focus_candidates(
+        "sco_chan_del",
+        sco,
+        {"near_functions": ["sco_disconn_cfm"], "path_functions": ["hci_disconn_complete_evt"]},
+        data_root=DATA_ROOT,
+    ) == (["sco_disconn_cfm"], ["hci_disconn_complete_evt"])
+
+
 def test_refine_result_keeps_the_written_call_sequence(tmp_path):
     chain_path = tmp_path / "l2cap.chains.json"
-    chains = [{"chain": [{"call": "syz_init_net_socket$bt_l2cap"}, {"call": "syz_emit_vhci"}]}]
+    chains = [{"chain": ["syz_init_net_socket$bt_l2cap", "syz_emit_vhci"]}]
     write_chain_result(
         "l2cap_connect_cfm",
         [{"stack": ["l2cap_connect_cfm", "hci_connect_cfm", "le_conn_complete_evt"], **record} for record in chains],
         path=str(chain_path),
         fuzz_guidance={
-            "focus_target_functions": ["^l2cap_connect_cfm$"],
-            "focus_hop1_functions": ["^hci_rx_work$"],
-            "focus_hop2_functions": ["^hci_event_packet$"],
+            "near_functions": ["le_conn_complete_evt"],
+            "path_functions": [],
         },
         data_root=DATA_ROOT,
     )
     guidance = json.loads(chain_path.read_text())["fuzz_guidance"]
-    assert guidance["focus_hop1_functions"] == ["^le_conn_complete_evt$"]
-    assert guidance["focus_hop2_functions"] == []
-    rose = [
-        {"stack": ["rose_transmit_link", "rose_write_internal", "rose_connect"], "chain": [{"call": "connect$rose"}]},
-        {"stack": ["rose_transmit_link", "rose_kick", "rose_sendmsg"], "chain": [{"call": "sendto$rose"}]},
-        {"stack": ["rose_transmit_link", "rose_write_internal", "rose_ioctl"], "chain": [{"call": "ioctl$SIOCRSACCEPT"}]},
+    assert json.loads(chain_path.read_text())["chains"][0]["chain"] == chains[0]["chain"]
+    assert list(guidance) == [
+        "target_function", "near_functions", "path_functions", "target_file",
     ]
-    assert hops_from_stacks("rose_transmit_link", rose, data_root=DATA_ROOT) == (["^rose_connect$"], [])
+    assert guidance["target_function"] == ["^l2cap_connect_cfm$"]
+    assert guidance["near_functions"] == ["^le_conn_complete_evt$"]
+    assert guidance["path_functions"] == []
+    assert guidance["target_file"] == ["net/bluetooth/l2cap_core.c"]
     visible = read_chain_result("l2cap_connect_cfm", path=str(chain_path), data_root=DATA_ROOT)
     assert visible.keys() == {"target", "chains"}
     assert visible["chains"] == [
         {"stack": ["l2cap_connect_cfm", "hci_connect_cfm", "le_conn_complete_evt"], **record}
         for record in chains
     ]
+    legacy_path = tmp_path / "legacy.chains.json"
+    legacy_path.write_text(json.dumps({"target": "l2cap_connect_cfm", "chains": [{
+        "stack": ["l2cap_connect_cfm"],
+        "chain": [{"call": "syz_emit_vhci"}],
+    }]}))
+    assert read_chain_result("l2cap_connect_cfm", path=str(legacy_path), data_root=DATA_ROOT)["chains"][0]["chain"] == ["syz_emit_vhci"]
     kept = [{
         "call": "syz_emit_vhci",
         "refinements": [{

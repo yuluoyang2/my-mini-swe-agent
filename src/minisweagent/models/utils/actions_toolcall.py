@@ -355,9 +355,7 @@ WRITE_CHAIN_RESULT_TOOL = {
     "function": {
         "name": "write_chain_result",
         "description": (
-            "Validate and write the final target-to-syzkaller syscall-chain result. "
-            "Each chain step may retain syzlang union, flags, const, integer, or string values "
-            "after level-by-level inspection. "
+            "Validate and write ordered syscall-name chains with their kernel call stacks. "
             "A successful write finishes the task."
         ),
         "parameters": {
@@ -375,50 +373,14 @@ WRITE_CHAIN_RESULT_TOOL = {
                         "properties": {
                             "chain": {
                                 "type": "array",
-                                "description": "Ordered syscall steps.",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "call": {
-                                            "type": "string",
-                                            "description": "Existing syzkaller syscall name.",
-                                        },
-                                        "refinements": {
-                                            "type": "array",
-                                            "description": "Optional concrete syzlang values to retain for this call occurrence.",
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "path": {
-                                                        "type": "string",
-                                                        "description": "Node path returned by read_syzlang_level. For a union this is the union node, not an arm path.",
-                                                    },
-                                                    "kind": {
-                                                        "type": "string",
-                                                        "enum": ["union", "flags", "const", "scalar", "string"],
-                                                    },
-                                                    "type": {
-                                                        "type": "string",
-                                                        "description": "Exact syzlang type returned for the node.",
-                                                    },
-                                                    "keep": {
-                                                        "type": "array",
-                                                        "items": {"type": "string"},
-                                                        "description": "Values to retain. Union, flags, and const must come from the node's choices. Scalar keeps integers. String keeps literals.",
-                                                    },
-                                                },
-                                                "required": ["path", "kind", "type", "keep"],
-                                            },
-                                        },
-                                    },
-                                    "required": ["call"],
-                                },
+                                "description": "Ordered syzkaller syscall names, for example [\"syz_usb_connect\", \"syz_usb_disconnect\"].",
+                                "items": {"type": "string", "minLength": 1},
                             },
                             "stack": {
                                 "type": "array",
-                                "maxItems": 3,
+                                "maxItems": 4,
                                 "items": {"type": "string"},
-                                "description": "At most 3 kernel function names: the target, its direct caller, and one caller above that. Names must come from read_kernel_source. Do not include syscalls.",
+                                "description": "At most 4 kernel function names: the target, its direct caller, and callers above that. Names must come from read_kernel_source. Do not include syscalls.",
                             },
                         },
                         "required": ["chain", "stack"],
@@ -430,27 +392,17 @@ WRITE_CHAIN_RESULT_TOOL = {
                 },
                 "fuzz_guidance": {
                     "type": "object",
-                    "description": "Optional fuzzing focus guidance derived from callgraph/source evidence.",
+                    "description": "Source-grounded B and C focus candidates. Target and target file are filled automatically; B is always non-empty in the written result.",
                     "properties": {
-                        "focus_target_functions": {
+                        "near_functions": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Regex for the exact target function to focus. At most one item.",
+                            "description": "B candidates: exact function names, no regex, at most three. Prefer selective functions 1-2 source-linked stack edges from the target. If only generic callers exist, include the nearest one. When omitted or empty, the writer fills the nearest verified stack caller.",
                         },
-                        "focus_hop1_functions": {
+                        "path_functions": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Ignored. Filled from stack frame 2, the direct caller of the target.",
-                        },
-                        "focus_hop2_functions": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Ignored. Filled from stack frame 3, the caller of the direct caller.",
-                        },
-                        "focus_subsystem_files": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Kernel .c source files that define the target path or subsystem entry. At most three items; do not include header files.",
+                            "description": "C candidates: exact function names, no regex, at most three. Choose upstream path functions or a required earlier callback from the target's driver. Leave empty if source evidence is weak.",
                         },
                     },
                 },
@@ -470,7 +422,7 @@ READ_CHAIN_RESULT_TOOL = {
         "name": "read_chain_result",
         "description": (
             "Read the written syscall sequences and their call stacks. "
-            "Use each stack as the source-reading path: the target, its direct caller, and one caller above."
+            "Use each stack as the source-reading path from the target through its callers."
         ),
         "parameters": {
             "type": "object",

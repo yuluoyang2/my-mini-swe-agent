@@ -8,6 +8,7 @@ from minisweagent.models.utils.chain_result_tools import (
     DEFAULT_DATA_ROOT,
     INT_VALUE_RE,
     REPO_ROOT,
+    call_name,
     safe_filename,
     validate_chain_result,
     validate_step_refinements,
@@ -50,7 +51,7 @@ def read_chain_result(
         "target": source["target"],
         "chains": [
             {
-                "chain": [{"call": step["call"]} for step in record["chain"]],
+                "chain": [call_name(step) for step in record["chain"]],
                 "stack": record["stack"],
             }
             for record in source["chains"]
@@ -62,8 +63,8 @@ def call_union(chains: list[dict[str, Any]]) -> list[str]:
     found = []
     for record in chains:
         for step in record["chain"]:
-            if step["call"] not in found:
-                found.append(step["call"])
+            if call_name(step) not in found:
+                found.append(call_name(step))
     return found
 
 
