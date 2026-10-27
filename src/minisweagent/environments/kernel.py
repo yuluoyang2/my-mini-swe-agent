@@ -7,6 +7,7 @@ from minisweagent.exceptions import Submitted
 from minisweagent.models.utils import (
     callgraph_tools,
     chain_result_tools,
+    entry_tools,
     fuzzing_coverage_tools,
     kernel_source_tools,
     refine_result_tools,
@@ -17,6 +18,9 @@ from minisweagent.models.utils import (
 class KernelEnvironmentConfig(LocalEnvironmentConfig):
     data_root: Path = kernel_source_tools.DEFAULT_DATA_ROOT
     linux_root: Path = kernel_source_tools.DEFAULT_LINUX_ROOT
+    kernel_arch: str = "x86_64"
+    syscall_table: str = entry_tools.DEFAULT_SYSCALL_TABLE
+    syscall_abis: list[str] = list(entry_tools.DEFAULT_SYSCALL_ABIS)
 
 
 class KernelEnvironment(LocalEnvironment):
@@ -57,6 +61,15 @@ class KernelEnvironment(LocalEnvironment):
             )
         if tool == "lookup_ops":
             return kernel_source_tools.lookup_ops(**args, data_root=self.config.data_root)
+        if tool == "search_kernel_source":
+            return entry_tools.search_kernel_source(**args, linux_root=self.config.linux_root)
+        if tool == "lookup_syscall":
+            return entry_tools.lookup_syscall(
+                **args,
+                linux_root=self.config.linux_root,
+                syscall_table=self.config.syscall_table,
+                syscall_abis=self.config.syscall_abis,
+            )
         if tool in CALLGRAPH_TOOLS:
             return CALLGRAPH_TOOLS[tool](**args, data_root=self.config.data_root)
         if tool in SYZLANG_TOOLS:
@@ -64,7 +77,14 @@ class KernelEnvironment(LocalEnvironment):
         if tool in FUZZING_COVERAGE_TOOLS:
             return FUZZING_COVERAGE_TOOLS[tool](**args, data_root=self.config.data_root)
         if tool in RESULT_TOOLS:
-            result = RESULT_TOOLS[tool](**args, data_root=self.config.data_root)
+            context = {"data_root": self.config.data_root}
+            if tool == "write_entry_result":
+                context |= {
+                    "linux_root": self.config.linux_root,
+                    "syscall_table": self.config.syscall_table,
+                    "syscall_abis": self.config.syscall_abis,
+                }
+            result = RESULT_TOOLS[tool](**args, **context)
             if tool not in FINISH_TOOLS:
                 return result
             submission = Path(result["path"]).read_text()
@@ -80,6 +100,7 @@ class KernelEnvironment(LocalEnvironment):
 
 CALLGRAPH_TOOLS = {
     "func_bfs": callgraph_tools.func_bfs,
+    "get_func_neighbors": entry_tools.get_func_neighbors,
 }
 
 SYZLANG_TOOLS = {
@@ -96,9 +117,10 @@ FUZZING_COVERAGE_TOOLS = {
 }
 
 RESULT_TOOLS = {
+    "write_entry_result": entry_tools.write_entry_result,
     "write_chain_result": chain_result_tools.write_chain_result,
     "read_chain_result": refine_result_tools.read_chain_result,
     "write_refine_result": refine_result_tools.write_refine_result,
 }
 
-FINISH_TOOLS = {"write_chain_result", "write_refine_result"}
+FINISH_TOOLS = {"write_chain_result", "write_refine_result", "write_entry_result"}

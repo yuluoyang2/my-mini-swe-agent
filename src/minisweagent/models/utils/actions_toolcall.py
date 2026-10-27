@@ -32,7 +32,7 @@ READ_KERNEL_SOURCE_TOOL = {
         "name": "read_kernel_source",
         "description": (
             "Read Linux kernel source by function name, type name, or file path. "
-            "Supply exactly one of func, type_name, or path. Use this when func_bfs source is missing or truncated."
+            "Supply exactly one of func, type_name, or path. File mode includes numbered lines, comments, macros, and .tbl files."
         ),
         "parameters": {
             "type": "object",
@@ -81,6 +81,115 @@ LOOKUP_OPS_TOOL = {
 KERNEL_SOURCE_TOOLS = [
     READ_KERNEL_SOURCE_TOOL,
     LOOKUP_OPS_TOOL,
+]
+
+ENTRY_PAGE_PROPERTIES = {
+    "offset": {"type": "integer", "minimum": 0, "description": "Pagination offset. Default 0."},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum records per page."},
+}
+
+ENTRY_TOOLS = KERNEL_SOURCE_TOOLS + [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_kernel_source",
+            "description": (
+                "Search the kernel source tree, including comments, function references, dispatch arrays, "
+                "registrations, macros, and syscall .tbl files. Returns matching lines with context and next_offset. "
+                "Matches are text references; inspect source to identify their meaning."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1},
+                    "path": {"type": "string", "description": "File or directory within the kernel tree. Default entire tree."},
+                    "regex": {"type": "boolean", "description": "Treat query as regex. Default false (literal search)."},
+                    "context": {"type": "integer", "minimum": 0, "maximum": 20, "description": "Context lines on each side. Default 3."},
+                    **ENTRY_PAGE_PROPERTIES,
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_func_neighbors",
+            "description": (
+                "Query one layer of MLTA callers or callees, with candidate source files and pagination. "
+                "Callgraph edges may be spurious or missing; use source references and registrations to interpret them. "
+                "Callee file lists may contain multiple definitions with the same name."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "function": {"type": "string", "minLength": 1},
+                    "direction": {"type": "string", "enum": ["callers", "callees"], "description": "Default callers."},
+                    "file_hint": {"type": "string", "description": "Filter caller files: returned callers, or the start definition in callees mode."},
+                    **ENTRY_PAGE_PROPERTIES,
+                },
+                "required": ["function"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_syscall",
+            "description": (
+                "Search the configured architecture's syscall .tbl, returning Linux names, ABI, entry symbols, "
+                "source lines, and original rows. Empty query lists entries. Original tables can also be read with read_kernel_source."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Literal substring of a table row, e.g. a syscall name or entry symbol."},
+                    "abis": {"type": "array", "items": {"type": "string"}, "description": "Optional ABI override. Defaults to environment syscall_abis."},
+                    **ENTRY_PAGE_PROPERTIES,
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_entry_result",
+            "description": (
+                "Write interface-grouped Linux syscall mappings to results/<target>.entry.json and finish. "
+                "The output has top-level function (from target) and entries; each entry contains syscall and resource. "
+                "Syscall names are checked against the configured table and ABI. "
+                "Resource contains key interface parameter identifiers, values, device paths, or user-interface structure names. "
+                "Multiple related parameters are allowed; omit explanations, call chains, internal handlers, and code snippets. "
+                "Entries contain only syscall names and key resource parameters. Group alternative interfaces separately."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "minLength": 1},
+                    "entries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "syscall": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                                "resource": {
+                                    "type": "array",
+                                    "description": (
+                                        "Key interface parameter identifiers, values, device paths, or structure names. "
+                                        "Multiple related parameters are allowed; omit explanations and code."
+                                    ),
+                                    "items": {"type": "string", "minLength": 1},
+                                },
+                            },
+                            "required": ["syscall", "resource"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["target", "entries"],
+            },
+        },
+    },
 ]
 
 FUNC_BFS_TOOL = {
@@ -499,6 +608,7 @@ REFINE_RESULT_TOOLS = [
 
 TOOL_GROUPS = {
     "bash": [BASH_TOOL],
+    "entry": ENTRY_TOOLS,
     "kernel_source": KERNEL_SOURCE_TOOLS,
     "callgraph": FUNC_GRAPH_TOOLS,
     "syzlang": SYZLANG_TOOLS,
